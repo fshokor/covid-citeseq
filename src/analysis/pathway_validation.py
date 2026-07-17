@@ -14,6 +14,7 @@ cache and can persist it across notebook runs however they like.
 """
 
 import io
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -281,3 +282,77 @@ def combined_verdict(
         default="none",
     )
     return combined
+
+
+# --------------------------------------------------------------------------
+# Query-set scoping (nb09's trustworthy-core / artifact-flag logic)
+# --------------------------------------------------------------------------
+# Pathway lookups (esp. STRING, rate-limited) are wasted on pairs the model
+# already got right (trustworthy core) or that are already known artifacts --
+# scope down to the ambiguous middle before spending API calls.
+
+TECHNICAL_GENE_PATTERNS = ["^HB[ABDGEZQ]", "^MT-", "^RPS", "^RPL"]  # hemoglobin, mitochondrial, ribosomal
+
+
+def build_trustworthy_core(
+    cognate_ranks: pd.DataFrame,
+    bootstrap_rank1: pd.DataFrame,
+    min_bootstrap_frequency: float = 0.8,
+) -> pd.DataFrame:
+    """Proteins where the model's #1 gene is BOTH the literal cognate gene AND bootstrap-stable.
+
+    cognate_ranks: output of evaluate.cognate_gene_rank (needs 'protein', 'cognate_rank').
+    bootstrap_rank1: 'bootstrap_rank1' entry from training.validation.validate_variant's
+                      output dict (needs 'protein', 'rank1_match_frequency').
+    """
+    merged = cognate_ranks.merge(bootstrap_rank1[["protein", "rank1_match_frequency"]], on="protein")
+    merged["is_cognate_rank1"] = merged["cognate_rank"] == 1
+    merged["is_bootstrap_stable"] = merged["rank1_match_frequency"] >= min_bootstrap_frequency
+    merged["trustworthy"] = merged["is_cognate_rank1"] & merged["is_bootstrap_stable"]
+    return merged
+
+
+def flag_artifacts(
+    check_df: pd.DataFrame,
+    technical_gene_patterns: list[str] = TECHNICAL_GENE_PATTERNS,
+    large_rank_gap_corr_thresh: float = 0.3,
+    large_rank_gap_rank_thresh: int = 50,
+) -> pd.DataFrame:
+    """Flag top-predictor picks that likely aren't real biological signal.
+
+    Expects the output of evaluate.raw_correlation_check (needs 'top_predictor_gene',
+    'top_predictor_weak_raw_corr', 'cognate_raw_r', 'cognate_rank'). Three flags,
+    combined into likely_artifact:
+      top_predictor_is_technical -- top pick is hemoglobin/mitochondrial/ribosomal
+                                     (reflects ambient RNA or cell state, not specific regulation)
+      large_rank_gap              -- cognate gene has a strong raw correlation but
+                                      ranked far from #1 anyway (model missed an easy case badly)
+      top_predictor_weak_raw_corr -- carried over from raw_correlation_check
+    """
+    pattern = re.compile("|".join(technical_gene_patterns))
+    out = check_df.copy()
+    out["top_predictor_is_technical"] = out["top_predictor_gene"].apply(lambda g: bool(pattern.match(str(g))))
+    out["large_rank_gap"] = (
+        (out["cognate_raw_r"].abs() > large_rank_gap_corr_thresh) & (out["cognate_rank"] > large_rank_gap_rank_thresh)
+    )
+    out["likely_artifact"] = (
+        out["top_predictor_weak_raw_corr"] | out["top_predictor_is_technical"] | out["large_rank_gap"]
+    )
+    return out
+
+
+def build_query_set(
+    cognate_ranks: pd.DataFrame,
+    trustworthy_core: pd.DataFrame,
+    artifact_flags: pd.DataFrame,
+) -> pd.DataFrame:
+    """The gray-zone pairs worth a pathway lookup: not already trustworthy, not
+    already flagged as artifacts, and the model didn't rank the cognate gene #1.
+    """
+    trustworthy_proteins = set(trustworthy_core.loc[trustworthy_core["trustworthy"], "protein"])
+    artifact_proteins = set(artifact_flags.loc[artifact_flags["likely_artifact"], "protein"])
+    return cognate_ranks[
+        (~cognate_ranks["protein"].isin(trustworthy_proteins))
+        & (~cognate_ranks["protein"].isin(artifact_proteins))
+        & (cognate_ranks["cognate_rank"] > 1)
+    ].copy()
