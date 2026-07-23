@@ -261,8 +261,14 @@ def combined_verdict(
     or TRRUST regulation confirms it. evidence_type picks the strongest
     single reason, in priority order: complex > regulatory > STRING hard
     evidence > STRING (any) > none.
+
+    Preserves 'cognate_gene' and 'top_predictor_gene' from string_results if
+    present (they usually are -- string_validate_pairs etc. carry over every
+    input column), so the returned table -- and anything saved from it, like
+    unexplained_pairs.csv -- still identifies which genes each row is about.
     """
-    string_cols = [key_col, "string_known_interaction", "string_hard_evidence", "string_score"]
+    id_cols = [c for c in ("cognate_gene", "top_predictor_gene") if c in string_results.columns]
+    string_cols = [key_col, *id_cols, "string_known_interaction", "string_hard_evidence", "string_score"]
     complex_cols = [key_col, "shared_complex", "complex_names"]
     trrust_cols = [key_col, "trrust_regulatory_pair", "trrust_direction", "trrust_regtype"]
 
@@ -292,6 +298,28 @@ def combined_verdict(
 # scope down to the ambiguous middle before spending API calls.
 
 TECHNICAL_GENE_PATTERNS = ["^HB[ABDGEZQ]", "^MT-", "^RPS", "^RPL"]  # hemoglobin, mitochondrial, ribosomal
+
+# Broader ambient/housekeeping markers: cytoskeletal, glycolytic, translation
+# elongation factors, ferritin, beta-2-microglobulin -- genes so highly and
+# ubiquitously expressed that a "top predictor" hit on one of these is more
+# likely reflecting overall cell size/health/ambient RNA than a specific
+# regulatory relationship with the protein in question.
+EXTENDED_TECHNICAL_GENE_PATTERNS = TECHNICAL_GENE_PATTERNS + [
+    "^ACTB$", "^ACTG1$",       # beta/gamma actin
+    "^TUBB", "^TUBA",          # tubulin
+    "^GAPDH$",                 # glycolysis
+    "^B2M$",                   # beta-2-microglobulin, ubiquitous
+    "^TMSB4X$", "^TMSB10$",    # thymosin beta, very high ambient expression
+    "^EEF1A1$", "^EEF2$",      # translation elongation factors
+    "^FTL$", "^FTH1$",         # ferritin
+    "^TPT1$",                  # tumor protein translationally controlled
+]
+
+
+def flag_technical_genes(genes: pd.Series, technical_gene_patterns: list[str] = TECHNICAL_GENE_PATTERNS) -> pd.Series:
+    """Boolean mask: does each gene name match a known ambient/technical marker pattern?"""
+    pattern = re.compile("|".join(technical_gene_patterns))
+    return genes.apply(lambda g: bool(pattern.match(str(g))))
 
 
 def build_trustworthy_core(
@@ -331,7 +359,7 @@ def flag_artifacts(
     """
     pattern = re.compile("|".join(technical_gene_patterns))
     out = check_df.copy()
-    out["top_predictor_is_technical"] = out["top_predictor_gene"].apply(lambda g: bool(pattern.match(str(g))))
+    out["top_predictor_is_technical"] = flag_technical_genes(out["top_predictor_gene"], technical_gene_patterns)
     out["large_rank_gap"] = (
         (out["cognate_raw_r"].abs() > large_rank_gap_corr_thresh) & (out["cognate_rank"] > large_rank_gap_rank_thresh)
     )

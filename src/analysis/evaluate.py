@@ -266,3 +266,173 @@ def raw_correlation_summary(check_df: pd.DataFrame) -> dict:
         "n_weak_raw_corr_top_pick": int(check_df["top_predictor_weak_raw_corr"].sum()),
         "n_strong_cognate_not_top": int(check_df["cognate_strong_but_not_top"].sum()),
     }
+
+
+# --------------------------------------------------------------------------
+# Nonlinearity check
+# --------------------------------------------------------------------------
+# Model-independent -- works directly off the raw corrected data, no trained
+# model involved. Answers two separate questions:
+#   1. nonlinearity_check    -- is there curvature in the RNA-protein
+#                                relationship at all (straight line vs. a
+#                                flexible, non-parametric fit)?
+#   2. stratified_linear_check -- if so, is that curvature explained by
+#                                cell-type structure (separate straight lines
+#                                per cell type), or does it persist within a
+#                                single cell type? The former is a confound
+#                                story; the latter is a real nonlinear
+#                                biological relationship.
+
+def nonlinearity_check(
+    X: np.ndarray,
+    Y: np.ndarray,
+    gene_names: list[str],
+    protein_names: list[str],
+    gene_protein_pairs: pd.DataFrame,
+    n_bins: int = 10,
+    min_per_bin: int = 5,
+) -> pd.DataFrame:
+    """Compare a straight-line fit against a flexible binned-mean fit, per pair.
+
+    gene_protein_pairs needs 'protein' and 'cognate_gene' columns (e.g. built
+    directly from gene_map, or from cognate_gene_rank's output).
+
+    For each pair: fits a line, then splits RNA expression into n_bins
+    quantile bins and uses each bin's mean protein value as a fully flexible
+    (non-parametric) prediction -- no assumed functional form, so it can
+    capture curvature, plateaus, or non-monotonic shapes a line would miss.
+
+    nonlinearity_gap = binned_r2 - linear_r2. Near zero means a line already
+    captures the relationship as well as a flexible fit can; a large
+    positive value means real curvature the line is missing.
+    """
+    gene_idx = {g: i for i, g in enumerate(gene_names)}
+    protein_idx = {p: i for i, p in enumerate(protein_names)}
+
+    rows = []
+    for _, row in gene_protein_pairs.iterrows():
+        protein, gene = row["protein"], row["cognate_gene"]
+        if gene not in gene_idx or protein not in protein_idx:
+            continue
+        x = X[:, gene_idx[gene]]
+        y = Y[:, protein_idx[protein]]
+        ss_tot = np.sum((y - y.mean()) ** 2)
+
+        if np.std(x) == 0 or ss_tot == 0:
+            rows.append({"protein": protein, "cognate_gene": gene, "linear_r2": np.nan,
+                         "binned_r2": np.nan, "nonlinearity_gap": np.nan, "n_bins_used": 0})
+            continue
+
+        slope, intercept = np.polyfit(x, y, 1)
+        ss_res_linear = np.sum((y - (slope * x + intercept)) ** 2)
+        linear_r2 = 1 - ss_res_linear / ss_tot
+
+        bin_edges = np.quantile(x, np.linspace(0, 1, n_bins + 1))
+        bin_edges[-1] += 1e-9  # include the max value in the last bin
+        bin_idx = np.clip(np.digitize(x, bin_edges[1:-1]), 0, n_bins - 1)
+        bin_means = pd.Series(y).groupby(bin_idx).transform("mean").values
+        n_bins_used = int(pd.Series(bin_idx).value_counts().ge(min_per_bin).sum())
+        ss_res_binned = np.sum((y - bin_means) ** 2)
+        binned_r2 = 1 - ss_res_binned / ss_tot
+
+        rows.append({
+            "protein": protein, "cognate_gene": gene,
+            "linear_r2": linear_r2, "binned_r2": binned_r2,
+            "nonlinearity_gap": binned_r2 - linear_r2, "n_bins_used": n_bins_used,
+        })
+    return pd.DataFrame(rows)
+
+
+def stratified_linear_check(
+    X: np.ndarray,
+    Y: np.ndarray,
+    gene_names: list[str],
+    protein_names: list[str],
+    gene_protein_pairs: pd.DataFrame,
+    cell_type_labels: np.ndarray,
+    min_cells_per_type: int = 20,
+) -> pd.DataFrame:
+    """Fit a SEPARATE straight line per cell type, per pair, and pool the residuals.
+
+    cell_type_labels: one label per cell, aligned with the rows of X/Y. Types
+    with fewer than min_cells_per_type cells are pooled into 'other' rather
+    than dropped, so every cell still contributes.
+
+    Compare stratified_linear_r2 against nonlinearity_check's linear_r2 and
+    binned_r2 for the same pair:
+      - stratified_linear_r2 close to binned_r2 -> the apparent curvature is
+        explained by cell-type structure (piecewise-linear-by-cell-type) --
+        a confound, not a real nonlinear relationship.
+      - stratified_linear_r2 still well below binned_r2 -> curvature persists
+        even within a single cell type -- a real nonlinear relationship.
+    """
+    labels = pd.Series(cell_type_labels).astype(str).values
+    counts = pd.Series(labels).value_counts()
+    small_types = set(counts[counts < min_cells_per_type].index)
+    grouped_labels = np.where(np.isin(labels, list(small_types)), "other", labels)
+
+    gene_idx = {g: i for i, g in enumerate(gene_names)}
+    protein_idx = {p: i for i, p in enumerate(protein_names)}
+
+    rows = []
+    for _, row in gene_protein_pairs.iterrows():
+        protein, gene = row["protein"], row["cognate_gene"]
+        if gene not in gene_idx or protein not in protein_idx:
+            continue
+        x = X[:, gene_idx[gene]]
+        y = Y[:, protein_idx[protein]]
+        ss_tot = np.sum((y - y.mean()) ** 2)
+        if ss_tot == 0:
+            rows.append({"protein": protein, "cognate_gene": gene, "stratified_linear_r2": np.nan, "n_groups": 0})
+            continue
+
+        y_pred = np.empty_like(y, dtype=float)
+        n_groups = 0
+        for group in np.unique(grouped_labels):
+            mask = grouped_labels == group
+            if mask.sum() < 3 or np.std(x[mask]) == 0:
+                y_pred[mask] = y[mask].mean()
+                continue
+            slope, intercept = np.polyfit(x[mask], y[mask], 1)
+            y_pred[mask] = slope * x[mask] + intercept
+            n_groups += 1
+
+        ss_res = np.sum((y - y_pred) ** 2)
+        rows.append({
+            "protein": protein, "cognate_gene": gene,
+            "stratified_linear_r2": 1 - ss_res / ss_tot, "n_groups": n_groups,
+        })
+    return pd.DataFrame(rows)
+
+
+def classify_relationship_source(
+    df: pd.DataFrame,
+    min_relationship_r2: float = 0.05,
+    confound_dominance_thresh: float = 0.1,
+) -> pd.Series:
+    """Classify each pair's relationship using linear_r2 (pooled) and stratified_linear_r2.
+
+    df needs 'linear_r2' and 'stratified_linear_r2' columns (merge the outputs
+    of nonlinearity_check and stratified_linear_check to get both). Three categories:
+
+      'weak_or_no_relationship'      -- stratified_linear_r2 < min_relationship_r2:
+                                         no meaningful relationship even after
+                                         accounting for cell type.
+      'cell_type_driven'             -- stratified_linear_r2 exceeds linear_r2 by
+                                         more than confound_dominance_thresh: the
+                                         apparent relationship depends heavily on
+                                         cell-type grouping (a confound, not real
+                                         gene-level coupling).
+      'consistent_across_cell_types' -- otherwise: a real relationship that holds
+                                         reasonably well even pooled across cell
+                                         types, not primarily a cell-type artifact.
+    """
+    gap = df["stratified_linear_r2"] - df["linear_r2"]
+    return pd.Series(
+        np.select(
+            [df["stratified_linear_r2"] < min_relationship_r2, gap > confound_dominance_thresh],
+            ["weak_or_no_relationship", "cell_type_driven"],
+            default="consistent_across_cell_types",
+        ),
+        index=df.index,
+    )
